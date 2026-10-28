@@ -853,29 +853,42 @@ func (cs *controller) ControllerExpandVolume(
 // checkExpandCapacity fails with ResourceExhausted when the additional space an
 // expansion needs does not fit in the free capacity of the volume's pool, so
 // that the ZFSVolume is not updated with a size that can never be satisfied.
-// The check relies on the capacity reported by the node's ZFSNode, and is
-// skipped whenever that information is not available.
+// The check relies on the capacity reported by the node's ZFSNode. That value is
+// refreshed periodically, so the check is advisory: it catches requests that
+// cannot fit, but two expansions against the same pool may both pass it. When
+// the ZFSNode is not available the check is skipped, the same way GetCapacity
+// skips such nodes, and ZFS itself rejects a resize that does not fit.
+// ResourceExhausted is used rather than OutOfRange so that the resize is retried
+// once space is freed in the pool.
 func (cs *controller) checkExpandCapacity(vol *zfsapi.ZFSVolume, additional int64) error {
 	mappedNodeID, err := zfs.GetNodeID(vol.Spec.OwnerNodeID)
 	if err != nil {
+		klog.Warningf("Unable to find mapped node id for %s", vol.Spec.OwnerNodeID)
 		mappedNodeID = vol.Spec.OwnerNodeID
 	}
 	v, exists, err := cs.zfsNodeInformer.GetIndexer().GetByKey(zfs.OpenEBSNamespace + "/" + mappedNodeID)
-	if err != nil || !exists {
+	if err != nil {
+		klog.Warningf("skipping capacity check for expansion of %s: unable to query the zfsNode informer cache: %v", vol.Name, err)
+		return nil
+	}
+	if !exists {
+		klog.Warningf("skipping capacity check for expansion of %s: zfsNode %s not found", vol.Name, mappedNodeID)
 		return nil
 	}
 	zfsNode, ok := v.(*zfsapi.ZFSNode)
 	if !ok {
+		klog.Warningf("skipping capacity check for expansion of %s: unexpected object in the zfsNode informer cache", vol.Name)
 		return nil
 	}
 	return verifyExpandCapacity(zfsNode.Pools, vol, additional)
 }
 
 // verifyExpandCapacity checks the additional space against the free capacity of
-// the pool the volume lives in. A thin provisioned volume reserves no space, so
-// it is never rejected.
+// the pool the volume lives in. Volumes that do not reserve space (see
+// reservesSpace) consume no pool capacity when they grow, so they are never
+// rejected.
 func verifyExpandCapacity(pools []zfsapi.Pool, vol *zfsapi.ZFSVolume, additional int64) error {
-	if vol.Spec.ThinProvision == "yes" || additional <= 0 {
+	if additional <= 0 || !reservesSpace(vol.Spec.VolumeType, vol.Spec.ThinProvision) {
 		return nil
 	}
 	pool := poolRoot(vol.Spec.PoolName)
